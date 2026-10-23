@@ -31,6 +31,18 @@ import { PostRequest, PutRequest } from '@/utils/requests';
 import { RootStackParamList } from '@/navigation/navigator';
 import { UserAvatarWithStatus } from '@/components/ui/user-avatar-with-status';
 import { formatPreviewMessage } from '@/utils/message-text';
+import ChatSwipeRow from '@/components/chat/chat-swipe-row';
+import { ShowNotify } from '@/components/ui/toast';
+import {
+  ChatSwipeFlags,
+  SwipeFlagAction,
+  applySwipeAction,
+  effectiveUnreadCount,
+  loadChatSwipeFlags,
+  saveChatSwipeFlags,
+} from '@/utils/chat-swipe-state';
+
+const EMPTY_SWIPE_FLAGS: ChatSwipeFlags = { muted: false, markedUnread: false };
 
 const HomeScreen = () => {
   const navigation = useNavigation<DrawerNavigationProp<RootStackParamList>>();
@@ -42,6 +54,10 @@ const HomeScreen = () => {
   const [search, setSearch] = useState('');
   const [_chatLoading, setChatLoading] = useState(false);
   const { loading, loadingMore, refresh, loadMore } = useDMs(orgId, search);
+  const [swipeFlags, setSwipeFlags] = useState<Record<string, ChatSwipeFlags>>(
+    {},
+  );
+  const swipeFlagsRef = React.useRef(swipeFlags);
 
   const totalUnreadCount =
     dms?.filter((i: Chat) => i.thread_count > 0).length || 0;
@@ -81,6 +97,12 @@ const HomeScreen = () => {
   }, [dms, activeCategory]);
 
   const handleNavigate = (props: Chat) => {
+    if (props?.channel_id && swipeFlagsRef.current[props.channel_id]?.markedUnread) {
+      setBothSwipeFlags(
+        props.channel_id,
+        applySwipeAction(swipeFlagsRef.current[props.channel_id], 'clearMarkedUnread'),
+      );
+    }
     if (props?.channel_type === 'dm') {
       dispatch({ type: ACTIONS.PARTICIPANT, payload: props.participants });
       dispatch({
@@ -144,6 +166,92 @@ const HomeScreen = () => {
       });
     } else {
       setChatLoading(false);
+    }
+  };
+
+  const setBothSwipeFlags = (
+    channelId: string,
+    flags: ChatSwipeFlags,
+  ) => {
+    setSwipeFlags(prev => ({ ...prev, [channelId]: flags }));
+    swipeFlagsRef.current = { ...swipeFlagsRef.current, [channelId]: flags };
+    saveChatSwipeFlags(orgId, channelId, flags);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const hydrate = async () => {
+      const next: Record<string, ChatSwipeFlags> = {
+        ...swipeFlagsRef.current,
+      };
+      const rows = (filteredDms || []).slice(0, 50);
+      await Promise.all(
+        rows.map(async (chat: Chat) => {
+          if (!chat.channel_id) return;
+          next[chat.channel_id] = await loadChatSwipeFlags(
+            orgId,
+            chat.channel_id,
+          );
+        }),
+      );
+      if (!cancelled) setSwipeFlags(next);
+    };
+    hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [filteredDms]);
+
+  const handleFlagAction = (chat: Chat, action: SwipeFlagAction) => {
+    if (!chat?.channel_id) return;
+    const previous =
+      swipeFlagsRef.current[chat.channel_id] ?? { ...EMPTY_SWIPE_FLAGS };
+    const next = applySwipeAction(previous, action);
+    setBothSwipeFlags(chat.channel_id, next);
+
+    const messages: Record<SwipeFlagAction, string> = {
+      mute: 'Chat muted',
+      unmute: 'Chat unmuted',
+      markUnread: 'Marked as unread',
+      clearMarkedUnread: 'Unread mark cleared',
+    };
+
+    ShowNotify(messages[action], 'Tap to undo', undefined, () => {
+      setBothSwipeFlags(chat.channel_id, previous);
+    });
+  };
+
+  const handleFavoriteToggle = async (chat: Chat) => {
+    if (!chat?.channel_id || !orgId) return;
+    const wasFavorite = Boolean(chat.is_favourite);
+    const list = (dms || []).map((c: Chat) =>
+      c.channel_id === chat.channel_id ? { ...c, is_favourite: !wasFavorite } : c,
+    );
+    dispatch({ type: ACTIONS.DMS, payload: list });
+
+    const { error } = await PostRequest(
+      `/organisations/${orgId}/dms/${chat.channel_id}/favourite`,
+      {},
+    );
+
+    if (!error) {
+      ShowNotify(
+        wasFavorite ? 'Removed from favorites' : 'Added to favorites',
+        'Tap to undo',
+        undefined,
+        () => handleFavoriteToggle({ ...chat, is_favourite: !wasFavorite }),
+      );
+    } else {
+      const reverted = (dms || []).map((c: Chat) =>
+        c.channel_id === chat.channel_id ? { ...c, is_favourite: wasFavorite } : c,
+      );
+      dispatch({ type: ACTIONS.DMS, payload: reverted });
+      ShowNotify(
+        'Favorite action failed',
+        'Tap to retry',
+        undefined,
+        () => handleFavoriteToggle(chat),
+      );
     }
   };
 
@@ -268,14 +376,20 @@ const HomeScreen = () => {
               showsVerticalScrollIndicator={false}
               renderItem={({ item }) => {
                 return (
-                  <TouchableOpacity
-                    style={styles.chatItem}
-                    onPress={() =>
-                      item.is_suggested
-                        ? handleSuggestNavigate(item)
-                        : handleNavigate(item)
-                    }
+                  <ChatSwipeRow
+                    chat={item}
+                    flags={swipeFlags[item.channel_id || ''] ?? EMPTY_SWIPE_FLAGS}
+                    onFavoriteToggle={handleFavoriteToggle}
+                    onFlagAction={handleFlagAction}
                   >
+                    <TouchableOpacity
+                      style={styles.chatItem}
+                      onPress={() =>
+                        item.is_suggested
+                          ? handleSuggestNavigate(item)
+                          : handleNavigate(item)
+                      }
+                    >
                     <View style={styles.avatarWrapper}>
                       {item.channel_type === 'group_dm' ? (
                         <View style={styles.groupAvatarContainer}>
@@ -338,20 +452,28 @@ const HomeScreen = () => {
                             item.preview_message || 'Chat with user',
                           )}
                         </AppText>
-                        {!!item.thread_count && item.thread_count > 0 && (
+                        {!!effectiveUnreadCount(
+                          item,
+                          swipeFlags[item.channel_id || ''] ?? EMPTY_SWIPE_FLAGS,
+                        ) && (
                           <View style={styles.countBadge}>
                             <AppText
                               size={12}
                               variant="bold"
                               style={styles.countText}
                             >
-                              {item.thread_count}
+                              {effectiveUnreadCount(
+                                item,
+                                swipeFlags[item.channel_id || ''] ??
+                                  EMPTY_SWIPE_FLAGS,
+                              )}
                             </AppText>
                           </View>
                         )}
                       </View>
                     </View>
-                  </TouchableOpacity>
+                    </TouchableOpacity>
+                  </ChatSwipeRow>
                 );
               }}
               onEndReached={loadMore}
